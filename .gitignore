@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+checkpoints_gdrive_fallback/
+nuscenes_data/
+outputs/

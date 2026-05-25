@@ -26,6 +26,193 @@ from src.model.transformer import (
 from src.model.axial_attention import AxialAttention
 
 
+class PyrOccNet_S_0914_old_rep100x100_out100x100(nn.Module):
+    """
+    BEVT-based single-image model used by the older released Google Drive checkpoint.
+    """
+
+    def __init__(
+        self,
+        num_classes=11,
+        frontend="resnet50",
+        grid_res=1.0,
+        pretrained=True,
+        img_dims=[1600, 900],
+        z_range=[1.0, 6.0, 13.0, 26.0, 51.0],
+        h_cropped=[60.0, 60.0, 60.0, 60.0],
+        dla_norm="GroupNorm",
+        additions_BEVT_linear=False,
+        additions_BEVT_conv=False,
+        dla_l1_n_channels=32,
+        n_enc_layers=2,
+        n_dec_layers=2,
+    ):
+        super().__init__()
+
+        self.image_height = img_dims[1]
+        self.image_width = img_dims[0]
+        self.z_range = z_range
+
+        h_cropped = torch.tensor(h_cropped)
+        feat_h = torch.tensor([int(self.image_height / s) for s in [4, 8, 16, 32]])
+        crop = feat_h > h_cropped
+        h_crop_idx_start = ((feat_h - h_cropped) / 2).int().float() * crop.float()
+        h_crop_idx_end = (h_crop_idx_start + h_cropped) * crop.float() + feat_h * (
+            ~crop
+        ).float()
+        cropped_h = (h_crop_idx_end - h_crop_idx_start).int()
+        self.cropped_h = cropped_h
+
+        self.frontend = resnet_fpn_backbone(
+            backbone_name=frontend, pretrained=pretrained
+        )
+
+        self.bev8 = BEVT(
+            cropped_h[0],
+            z_range[4],
+            z_range[3],
+            grid_res,
+            additions_BEVT_linear,
+            additions_BEVT_conv,
+        )
+        self.bev16 = BEVT(
+            cropped_h[1],
+            z_range[3],
+            z_range[2],
+            grid_res,
+            additions_BEVT_linear,
+            additions_BEVT_conv,
+        )
+        self.bev32 = BEVT(
+            cropped_h[2],
+            z_range[2],
+            z_range[1],
+            grid_res,
+            additions_BEVT_linear,
+            additions_BEVT_conv,
+        )
+        self.bev64 = BEVT(
+            cropped_h[3],
+            z_range[1],
+            z_range[0],
+            grid_res,
+            additions_BEVT_linear,
+            additions_BEVT_conv,
+        )
+        self.bev_bn = nn.Sequential(nn.GroupNorm(16, 256), nn.ReLU(),)
+
+        n_channels = np.array(2 ** np.arange(4) * dla_l1_n_channels, dtype=int)
+        self.topdown_down_s1 = _resnet_bblock_enc_layer_old(
+            256, n_channels[0], stride=1, num_blocks=2
+        )
+        self.topdown_down_s2 = Down_old(n_channels[0], n_channels[1], num_blocks=2)
+        self.topdown_down_s4 = Down_old(n_channels[1], n_channels[2], num_blocks=2)
+        self.topdown_down_s8 = Down_old(n_channels[2], n_channels[3], num_blocks=2)
+
+        self.node_1_s1 = DLA_Node_old(n_channels[1], n_channels[0], norm=dla_norm)
+        self.node_2_s2 = DLA_Node_old(n_channels[2], n_channels[1], norm=dla_norm)
+        self.node_2_s1 = DLA_Node_old(n_channels[1], n_channels[0], norm=dla_norm)
+        self.node_3_s4 = DLA_Node_old(n_channels[3], n_channels[2], norm=dla_norm)
+        self.node_3_s2 = DLA_Node_old(n_channels[2], n_channels[1], norm=dla_norm)
+        self.node_3_s1 = DLA_Node_old(n_channels[1], n_channels[0], norm=dla_norm)
+
+        self.up_node_1_s1 = IDA_up(n_channels[1], n_channels[0], kernel_size=4)
+        self.up_node_2_s1 = IDA_up(n_channels[1], n_channels[0], kernel_size=4)
+        self.up_node_2_s2 = IDA_up(n_channels[2], n_channels[1], kernel_size=4)
+        self.up_node_3_s1 = IDA_up(n_channels[1], n_channels[0], kernel_size=4)
+        self.up_node_3_s2 = IDA_up(n_channels[2], n_channels[1], kernel_size=4)
+        self.up_node_3_s4 = IDA_up(n_channels[3], n_channels[2], kernel_size=3)
+
+        self.id_node_1_s1 = Identity()
+        self.id_node_2_s1 = Identity()
+        self.id_node_2_s2 = Identity()
+        self.id_node_3_s1 = Identity()
+        self.id_node_3_s2 = Identity()
+        self.id_node_3_s4 = Identity()
+
+        self.head_s8 = nn.Conv2d(n_channels[3], num_classes, kernel_size=3, padding=1)
+        self.head_s4 = nn.Conv2d(n_channels[2], num_classes, kernel_size=3, padding=1)
+        self.head_s2 = nn.Conv2d(n_channels[1], num_classes, kernel_size=3, padding=1)
+        self.head_s1 = nn.Conv2d(n_channels[0], num_classes, kernel_size=3, padding=1)
+
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]))
+
+        z_diff = np.diff(np.array(z_range))
+        z_idx = np.cumsum(z_diff)
+        self.register_buffer("z_idx", (torch.tensor(z_idx) / grid_res).int())
+        self.register_buffer("h_start", h_crop_idx_start.int())
+        self.register_buffer("h_end", h_crop_idx_end.int())
+
+    def forward(self, image, calib, grid):
+        N = image.shape[0]
+        image = (image - self.mean.view(3, 1, 1)) / self.std.view(3, 1, 1)
+
+        feats = self.frontend(image)
+        feat8 = feats["0"][:, :, self.h_start[0] : self.h_end[0], :]
+        feat16 = feats["1"][:, :, self.h_start[1] : self.h_end[1], :]
+        feat32 = feats["2"][:, :, self.h_start[2] : self.h_end[2], :]
+        feat64 = feats["3"][:, :, self.h_start[3] : self.h_end[3], :]
+
+        bev8 = self.bev8(feat8, calib, grid[:, self.z_idx[2] :])
+        bev16 = self.bev16(feat16, calib, grid[:, self.z_idx[1] : self.z_idx[2]])
+        bev32 = self.bev32(feat32, calib, grid[:, self.z_idx[0] : self.z_idx[1]])
+        bev64 = self.bev64(feat64, calib, grid[:, : self.z_idx[0]])
+        bev = torch.cat([bev64, bev32, bev16, bev8], dim=2)
+
+        down_s1 = checkpoint(self.topdown_down_s1, bev)
+        down_s2 = checkpoint(self.topdown_down_s2, down_s1)
+        down_s4 = checkpoint(self.topdown_down_s4, down_s2)
+        down_s8 = checkpoint(self.topdown_down_s8, down_s4)
+
+        node_1_s1 = checkpoint(
+            self.node_1_s1,
+            torch.cat([self.id_node_1_s1(down_s1), self.up_node_1_s1(down_s2)], dim=1),
+        )
+        node_2_s2 = checkpoint(
+            self.node_2_s2,
+            torch.cat([self.id_node_2_s2(down_s2), self.up_node_2_s2(down_s4)], dim=1),
+        )
+        node_2_s1 = checkpoint(
+            self.node_2_s1,
+            torch.cat(
+                [self.id_node_2_s1(node_1_s1), self.up_node_2_s1(node_2_s2)], dim=1
+            ),
+        )
+        node_3_s4 = checkpoint(
+            self.node_3_s4,
+            torch.cat([self.id_node_3_s4(down_s4), self.up_node_3_s4(down_s8)], dim=1),
+        )
+        node_3_s2 = checkpoint(
+            self.node_3_s2,
+            torch.cat(
+                [self.id_node_3_s2(node_2_s2), self.up_node_3_s2(node_3_s4)], dim=1
+            ),
+        )
+        node_3_s1 = checkpoint(
+            self.node_3_s1,
+            torch.cat(
+                [self.id_node_3_s1(node_2_s1), self.up_node_3_s1(node_3_s2)], dim=1
+            ),
+        )
+
+        batch, _, depth_s8, width_s8 = down_s8.size()
+        _, _, depth_s4, width_s4 = node_3_s4.size()
+        _, _, depth_s2, width_s2 = node_3_s2.size()
+        _, _, depth_s1, width_s1 = node_3_s1.size()
+        output_s8 = self.head_s8(down_s8).view(batch, -1, 1, depth_s8, width_s8)
+        output_s4 = self.head_s4(node_3_s4).view(batch, -1, 1, depth_s4, width_s4)
+        output_s2 = self.head_s2(node_3_s2).view(batch, -1, 1, depth_s2, width_s2)
+        output_s1 = self.head_s1(node_3_s1).view(batch, -1, 1, depth_s1, width_s1)
+
+        return (
+            output_s1.squeeze(2),
+            output_s2.squeeze(2),
+            output_s4.squeeze(2),
+            output_s8.squeeze(2),
+        )
+
+
 class PyrOccTranDetrMonoInv_S_0904_old(nn.Module):
     """
     BEV prediction with single-image inputs using the 0900 architecture.
